@@ -20,8 +20,10 @@ def _load_analyzer() -> Analyzer:
 
 
 def _results_to_dataframe(results: list[DetectionResult]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
+    rows = []
+    for r in results:
+        dominant = next((p for p in r.peaks if p.is_dominant), None)
+        rows.append(
             {
                 "File": r.file_name,
                 "Species": r.species,
@@ -29,15 +31,22 @@ def _results_to_dataframe(results: list[DetectionResult]) -> pd.DataFrame:
                 "Start (s)": r.start_time,
                 "End (s)": r.end_time,
                 "Duration (s)": r.duration,
-                "Category": r.category,
-                "Label": r.label,
-                "Peak Freq (Hz)": r.peak_frequency_hz,
+                "Spectral Type": r.spectral_type,
+                "Label": r.spectral_label,
+                "Duration Type": r.duration_type,
+                "Dominant Peak (Hz)": dominant.frequency_hz if dominant else 0,
+                "Dominant SNR (dB)": dominant.snr_db if dominant else 0,
+                "Num Peaks": len(r.peaks),
                 "Centroid StdDev": r.spectral_centroid_std,
-                "Noise Floor RMS": r.noise_floor_rms,
+                "Noise RMS": r.noise.rms_amplitude,
+                "Noise Avg Freq (Hz)": r.noise.avg_frequency_hz,
+                "Noise Range (Hz)": (
+                    f"{r.noise.freq_range_low_hz:.0f}\u2013{r.noise.freq_range_high_hz:.0f}"
+                ),
+                "Noise Level (dB)": r.noise.avg_magnitude_db,
             }
-            for r in results
-        ]
-    )
+        )
+    return pd.DataFrame(rows)
 
 
 def _show_results(results: list[DetectionResult]) -> None:
@@ -48,6 +57,13 @@ def _show_results(results: list[DetectionResult]) -> None:
         return
 
     st.success(f"**{len(results)}** detection(s) found.")
+
+    types = sorted({r.spectral_type for r in results})
+    type_summary = ", ".join(
+        f"**{t}** ({sum(1 for r in results if r.spectral_type == t)})"
+        for t in types
+    )
+    st.info(f"Spectral groups: {type_summary}")
 
     df = _results_to_dataframe(results)
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -63,9 +79,13 @@ def _show_results(results: list[DetectionResult]) -> None:
     cols = st.columns(2)
     for idx, r in enumerate(results):
         with cols[idx % 2]:
+            caption = (
+                f"{r.spectral_label} [{r.duration_type}]"
+                f"  \u2014  {r.species}  ({r.file_name})"
+            )
             st.image(
                 r.spectrogram_png,
-                caption=f"{r.label}  —  {r.species}  ({r.file_name})",
+                caption=caption,
                 use_container_width=True,
             )
 
@@ -77,7 +97,7 @@ def main() -> None:
         "Automated bird species detection and acoustic analysis powered by BirdNET"
     )
 
-    # ── Sidebar ──────────────────────────────────────────────────────
+    # -- Sidebar -------------------------------------------------------
     with st.sidebar:
         st.header("Configuration")
 
@@ -96,6 +116,18 @@ def main() -> None:
             help="Minimum BirdNET confidence to keep a detection.",
         )
 
+        similarity = st.slider(
+            "Similarity Threshold",
+            min_value=0.05,
+            max_value=1.00,
+            value=0.30,
+            step=0.05,
+            help=(
+                "Cosine distance threshold for spectral grouping. "
+                "Lower = stricter (more groups), higher = looser (fewer groups)."
+            ),
+        )
+
         st.divider()
 
         uploaded_files = st.file_uploader(
@@ -112,7 +144,7 @@ def main() -> None:
             disabled=not can_run,
         )
 
-    # ── Main area ────────────────────────────────────────────────────
+    # -- Main area -----------------------------------------------------
     if "results" not in st.session_state:
         st.session_state.results = None
 
@@ -141,7 +173,9 @@ def main() -> None:
                 if error:
                     errors.append(error)
 
-            results = processor.process_files(paths, _on_progress)
+            results = processor.process_files(
+                paths, _on_progress, similarity_threshold=similarity
+            )
             bar.empty()
 
         if errors:
